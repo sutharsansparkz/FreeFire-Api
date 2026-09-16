@@ -6,7 +6,20 @@ from datetime import datetime, timedelta
 from Utilities.until import load_accounts
 from Api.Account import get_garena_token, get_major_login
 from Api.InGame import get_player_personal_show, get_player_stats, search_account_by_keyword
-from Configuration.APIConfiguration import RELEASEVERSION
+from Configuration.APIConfiguration import RELEASEVERSION, RELEASEVERSIONS
+
+
+def _where(resp):
+    bits = []
+    if isinstance(resp, dict):
+        if resp.get("_version"):
+            bits.append(f"version={resp.get('_version')}")
+        if resp.get("_host"):
+            bits.append(f"host={resp.get('_host')}")
+        if resp.get("_http_status") is not None:
+            bits.append(f"http={resp.get('_http_status')}")
+    bits.append(f"tried=[{','.join(RELEASEVERSIONS)}]")
+    return "(" + ", ".join(bits) + ")"
 
 
 def describe_major_login_failure(resp):
@@ -17,7 +30,7 @@ def describe_major_login_failure(resp):
     notice (e.g. "Protection Bypass" / "Exploiting loopholes" = guest
     account flagged). Surfacing it beats a generic "Major login failed".
     """
-    hint = (" If the reason mentions SignError, update FF_RELEASE_VERSION to the "
+    hint = (" If the reason mentions SignError, update FF_RELEASE_VERSION(S) to the "
             "current live OB version. If it mentions Protection Bypass / "
             "Exploiting loopholes, the guest account in AccountConfiguration.json "
             "is flagged — regenerate accounts from a real device/network (datacenter "
@@ -25,10 +38,12 @@ def describe_major_login_failure(resp):
     if not resp:
         return "Empty response from login server." + hint, hint
     if isinstance(resp, dict):
-        if resp.get("_raw_error"):
+        attempts = ""
+        if resp.get("_attempts"):
+            attempts = " Attempts: " + " | ".join(resp["_attempts"][:6])
+        if resp.get("_raw_error") and not (resp.get("_reason") or resp.get("queueInfo") or resp.get("blacklist")):
             detail = (f"Upstream: {resp.get('_raw_error')} "
-                      f"(host={resp.get('_host')}, http={resp.get('_http_status')}, "
-                      f"ReleaseVersion={RELEASEVERSION})." + hint)
+                      f"{_where(resp)}." + attempts + hint)
             return detail, hint
         parts = []
         if resp.get("_reason"):
@@ -38,9 +53,11 @@ def describe_major_login_failure(resp):
         if resp.get("blacklist"):
             parts.append(f"blacklist={resp['blacklist']}")
         if parts:
-            return ("Upstream MajorLogin rejected without token: " + "; ".join(parts) +
-                    f" (host={resp.get('_host')}, http={resp.get('_http_status')}, "
-                    f"ReleaseVersion={RELEASEVERSION})." + hint), hint
+            detail = ("Upstream MajorLogin rejected without token: " + "; ".join(parts) +
+                      f" {_where(resp)}.")
+            if resp.get("_attempts"):
+                detail += " Attempts: " + " | ".join(resp["_attempts"][:6])
+            return detail + hint, hint
         return (f"Upstream MajorLogin returned no token: {str(resp)[:300]}" + hint), hint
     return f"Upstream MajorLogin failure: {str(resp)[:300]}" + hint, hint
 

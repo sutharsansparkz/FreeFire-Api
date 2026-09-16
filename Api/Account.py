@@ -5,7 +5,7 @@ import requests
 import Proto.compiled.MajorLogin_pb2
 from Utilities.until import encode_protobuf, decode_protobuf
 import json
-from Configuration.APIConfiguration import RELEASEVERSION, DEBUG
+from Configuration.APIConfiguration import RELEASEVERSIONS, DEBUG
 
 
 def get_garena_token(uid, password):
@@ -138,13 +138,13 @@ def get_major_login(logintoken, openid):
     """
     Perform major login with the provided credentials
 
-    Tries the known loginbp hosts in order (Garena rotates between
-    ggblueshark / ggpolarbear). Returns the decoded response dict on
-    success (contains 'token' + 'serverUrl'), the decoded dict without a
-    token when the server queued/banned the account (contains 'queueInfo'
-    / 'blacklist'), or a dict with '_raw_error' when the server returned
-    plain text such as "SignError1". Returns False only on transport
-    failure.
+    Tries each configured ReleaseVersion (see RELEASEVERSIONS) against the
+    known loginbp hosts in order. The first response containing 'token' +
+    'serverUrl' wins (returned with '_version' noting which version worked).
+    If nothing yields a token, returns an aggregate dict with '_attempts'
+    plus the most informative failure detail ('_reason' for queue/ban
+    notices, else '_raw_error' for plain-text rejections like "SignError1").
+    Returns False only when every attempt failed at transport level.
 
     Args:
         logintoken (str): The login token
@@ -166,9 +166,9 @@ def get_major_login(logintoken, openid):
         "https://loginbp.ggpolarbear.com/MajorLogin",
     ]
 
-    # Headers (note: exactly one Content-Type; binary payload requires
+    # Base headers (note: exactly one Content-Type; binary payload requires
     # application/octet-stream, NOT x-www-form-urlencoded)
-    headers = {
+    base_headers = {
         'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 13; A063 Build/TKQ1.221220.001)",
         'Connection': "Keep-Alive",
         'Accept-Encoding': "gzip",
@@ -177,53 +177,79 @@ def get_major_login(logintoken, openid):
         'Authorization': "Bearer",
         'X-Unity-Version': "2018.4.11f1",
         'X-GA': "v1 1",
-        'ReleaseVersion': RELEASEVERSION,
     }
 
-    last_error = False
-    for url in urls:
-        try:
-            response = requests.post(url, data=encrypted_payload, headers=headers, timeout=15)
-        except requests.exceptions.RequestException as e:
-            print(f"[MajorLogin] Transport error ({url}): {e}")
-            last_error = False
-            continue
-        if DEBUG:
-            print(f"[MajorLogin] {url} HTTP {response.status_code} Response(raw):", response.content, "\n")
-        content = response.content or b""
-        # Non-200 responses are plain-text/HTML rejections (e.g. "SignError1",
-        # 503 routing pages) — never protobuf. Surface them directly.
-        if response.status_code != 200:
+    attempts = []
+    best_detail = None  # most informative failure (prefer queue/ban reasons)
+    for version in RELEASEVERSIONS:
+        headers = dict(base_headers)
+        headers['ReleaseVersion'] = version
+        for url in urls:
             try:
-                text = content.decode('utf-8', 'ignore').strip() or response.text.strip()
+                response = requests.post(url, data=encrypted_payload, headers=headers, timeout=15)
+            except requests.exceptions.RequestException as e:
+                print(f"[MajorLogin] Transport error ({url} {version}): {e}")
+                attempts.append(f"{version}@{url}: transport error {e}")
+                continue
+            if DEBUG:
+                print(f"[MajorLogin] {url} [{version}] HTTP {response.status_code} Response(raw):", response.content, "\n")
+            content = response.content or b""
+            # Non-200 responses are plain-text/HTML rejections (e.g. "SignError1",
+            # 503 routing pages) — never protobuf. Surface them directly.
+            if response.status_code != 200:
+                try:
+                    text = content.decode('utf-8', 'ignore').strip() or response.text.strip()
+                except Exception:
+                    text = response.text.strip()
+                detail = {
+                    "_raw_error": text[:500],
+                    "_http_status": response.status_code,
+                    "_host": url,
+                    "_version": version,
+                }
+                attempts.append(f"{version}@{url}: HTTP {response.status_code} {text[:80]}")
+                if best_detail is None:
+                    best_detail = detail
+                # SignError means this version is rejected: try the next
+                # version, but a 5xx/503 (routing) is worth retrying on the
+                # fallback host first.
+                if response.status_code in (502, 503, 504):
+                    continue
+                break
+            try:
+                # Decode and return the response as JSON
+                message = decode_protobuf(content, Proto.compiled.MajorLogin_pb2.response)
+                if isinstance(message, dict):
+                    message["_http_status"] = response.status_code
+                    message["_host"] = url
+                    message["_version"] = version
+                    reason = extract_login_reason(content)
+                    if reason:
+                        message["_reason"] = reason
+                if isinstance(message, dict) and message.get("token"):
+                    return message
+                attempts.append(
+                    f"{version}@{url}: no token"
+                    + (f" ({message.get('_reason')})" if isinstance(message, dict) and message.get("_reason") else "")
+                )
+                if isinstance(message, dict) and (message.get("_reason") or message.get("queueInfo") or message.get("blacklist")):
+                    best_detail = message
+                elif best_detail is None:
+                    best_detail = message if isinstance(message, dict) else None
             except Exception:
-                text = response.text.strip()
-            last_error = {
-                "_raw_error": text[:500],
-                "_http_status": response.status_code,
-                "_host": url,
-            }
-            # SignError means version/signature rejected: no point
-            # retrying the fallback host with the same version, but a
-            # 5xx/503 (routing) is worth retrying.
-            if response.status_code not in (502, 503, 504):
-                return last_error
-            continue
-        try:
-            # Decode and return the response as JSON
-            message = decode_protobuf(content, Proto.compiled.MajorLogin_pb2.response)
-            if isinstance(message, dict):
-                message["_http_status"] = response.status_code
-                message["_host"] = url
-                reason = extract_login_reason(content)
-                if reason:
-                    message["_reason"] = reason
-            return message
-        except Exception:
-            print("[MajorLogin] Error:", response.text)
-            last_error = {
-                "_raw_error": response.text.strip()[:500],
-                "_http_status": response.status_code,
-                "_host": url,
-            }
-    return last_error
+                print("[MajorLogin] Error:", response.text)
+                detail = {
+                    "_raw_error": response.text.strip()[:500],
+                    "_http_status": response.status_code,
+                    "_host": url,
+                    "_version": version,
+                }
+                attempts.append(f"{version}@{url}: decode error {response.text.strip()[:80]}")
+                if best_detail is None:
+                    best_detail = detail
+    if best_detail is None:
+        return False
+    if isinstance(best_detail, dict):
+        best_detail = dict(best_detail)
+        best_detail["_attempts"] = attempts
+    return best_detail
