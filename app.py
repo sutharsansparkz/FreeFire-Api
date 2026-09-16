@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import json
+import threading
 import time
 from datetime import datetime, timedelta
 from Utilities.until import load_accounts
@@ -62,6 +63,62 @@ def describe_major_login_failure(resp):
     return f"Upstream MajorLogin failure: {str(resp)[:300]}" + hint, hint
 
 
+# --- Per-server session cache -------------------------------------------
+# Every data endpoint needs a (token, serverUrl) pair. Logging in on every
+# request doubles upstream traffic and hammers Garena with fresh guest
+# logins — exactly the pattern abuse systems flag ("Protection Bypass" /
+# "Exploiting loopholes"). Cache successful logins per server and reuse
+# them until shortly before they expire (MajorLogin returns `ttl` seconds).
+_session_cache = {}
+_session_lock = threading.Lock()
+
+
+def _session_ttl_seconds(login_resp):
+    try:
+        ttl = int(login_resp.get("ttl", 0))
+    except (TypeError, ValueError):
+        ttl = 0
+    if ttl <= 0:
+        ttl = 3600
+    return max(60, min(ttl, 6 * 3600)) - 60
+
+
+def ensure_session(server):
+    """Return (ok, token, server_url, garena_resp, major_resp).
+
+    Serves successful logins from cache when fresh; otherwise performs the
+    Garena grant + MajorLogin flow once and caches the result. Never raises
+    for upstream failures (callers branch on `ok`); unexpected local errors
+    propagate as before.
+    """
+    now = time.time()
+    with _session_lock:
+        hit = _session_cache.get(server)
+        if hit and hit["expires_at"] > now:
+            cached = dict(hit)
+            cached["_cached"] = True
+            return True, cached["token"], cached["serverUrl"], None, cached
+    garena_resp = get_garena_token(accounts[server]['uid'], accounts[server]['password'])
+    if not garena_resp or 'access_token' not in garena_resp or 'open_id' not in garena_resp:
+        return False, None, None, garena_resp, None
+    major_resp = get_major_login(garena_resp["access_token"], garena_resp["open_id"])
+    if not major_resp or 'token' not in major_resp or 'serverUrl' not in major_resp:
+        return False, None, None, garena_resp, major_resp
+    with _session_lock:
+        _session_cache[server] = {
+            "token": major_resp["token"],
+            "serverUrl": major_resp["serverUrl"],
+            "expires_at": now + _session_ttl_seconds(major_resp),
+            "version": major_resp.get("_version"),
+        }
+    return True, major_resp["token"], major_resp["serverUrl"], garena_resp, major_resp
+
+
+def clear_session(server):
+    with _session_lock:
+        _session_cache.pop(server, None)
+
+
 accounts = load_accounts()
 
 
@@ -91,19 +148,18 @@ def get_search_account_by_keyword():
         if region not in accounts:
             return json.dumps({"error": f"Invalid server: {region}"}, indent=2), 400, {'Content-Type': 'application/json; charset=utf-8'}
         
-        # Authenticate with Garena
-        auth_response = get_garena_token(accounts[region]['uid'], accounts[region]['password'])
-        if not auth_response or 'access_token' not in auth_response:
+        # Authenticate (Garena grant + Major login, cached per server)
+        ok, token, server_url, auth_response, login_response = ensure_session(region)
+        if not ok and (not auth_response or 'access_token' not in auth_response):
             return json.dumps({"error": "Authentication failed"}, indent=2), 401, {'Content-Type': 'application/json; charset=utf-8'}
         
         # Get major login credentials
-        login_response = get_major_login(auth_response["access_token"], auth_response["open_id"])
-        if not login_response or 'token' not in login_response:
+        if not ok:
             detail, _ = describe_major_login_failure(login_response)
             return json.dumps({"error": "Major login failed", "detail": detail}, indent=2), 401, {'Content-Type': 'application/json; charset=utf-8'}
         
         # Search for accounts
-        search_results = search_account_by_keyword(login_response["serverUrl"], login_response["token"], search_term)
+        search_results = search_account_by_keyword(server_url, token, search_term)
         
         # Return formatted response
         formatted_response = json.dumps(search_results, indent=2, ensure_ascii=False)
@@ -162,29 +218,18 @@ def get_player_stat():
                 "message": "Matchmode must be 'CAREER', 'NORMAL', or 'RANKED'"
             }), 400
 
-        # Step 1: Get Garena token
+        # Steps 1+2: Garena token + Major login (cached per server)
         try:
-            garena_token_result = get_garena_token(accounts[server]['uid'], accounts[server]['password'])
-            
-            if not garena_token_result or 'access_token' not in garena_token_result:
+            ok, token, server_url, garena_token_result, major_login_result = ensure_session(server)
+
+            if not ok and (not garena_token_result or 'access_token' not in garena_token_result):
                 return jsonify({
                     "success": False,
                     "error": "Garena authentication failed",
                     "message": "Failed to obtain Garena access token"
                 }), 401
-                
-        except Exception as e:
-            return jsonify({
-                "success": False,
-                "error": "Garena authentication error",
-                "message": f"Failed to authenticate with Garena: {str(e)}"
-            }), 502
 
-        # Step 2: Get Major login
-        try:
-            major_login_result = get_major_login(garena_token_result["access_token"], garena_token_result["open_id"])
-            
-            if not major_login_result or 'token' not in major_login_result:
+            if not ok:
                 detail, _ = describe_major_login_failure(major_login_result)
                 return jsonify({
                     "success": False,
@@ -195,15 +240,15 @@ def get_player_stat():
         except Exception as e:
             return jsonify({
                 "success": False,
-                "error": "Major login error",
-                "message": f"Failed to login to Major: {str(e)}"
+                "error": "Garena authentication error",
+                "message": f"Failed to authenticate with Garena: {str(e)}"
             }), 502
 
         # Step 3: Get player stats
         try:
             player_stats = get_player_stats(
-                major_login_result["token"], 
-                major_login_result["serverUrl"], 
+                token, 
+                server_url, 
                 gamemode, 
                 uid, 
                 matchmode
@@ -413,9 +458,9 @@ def get_account_info():
             }
             return jsonify(response), 500, {'Content-Type': 'application/json; charset=utf-8'}
         
-        # Step 1: Get Garena token
-        garena_token_result = get_garena_token(accounts[server]['uid'], accounts[server]['password'])
-        if not garena_token_result or 'access_token' not in garena_token_result or 'open_id' not in garena_token_result:
+        # Steps 1+2: Garena token + Major login (cached per server)
+        ok, token, server_url, garena_token_result, major_login_result = ensure_session(server)
+        if not ok and (not garena_token_result or 'access_token' not in garena_token_result or 'open_id' not in garena_token_result):
             response = {
                 "status": "error",
                 "error": "Authentication Failed",
@@ -425,8 +470,7 @@ def get_account_info():
             return jsonify(response), 401, {'Content-Type': 'application/json; charset=utf-8'}
         
         # Step 2: Get major login
-        major_login_result = get_major_login(garena_token_result["access_token"], garena_token_result["open_id"])
-        if not major_login_result or 'serverUrl' not in major_login_result or 'token' not in major_login_result:
+        if not ok:
             detail, _ = describe_major_login_failure(major_login_result)
             response = {
                 "status": "error",
@@ -438,8 +482,8 @@ def get_account_info():
         
         # Step 3: Get player personal show data
         player_personal_show_result = get_player_personal_show(
-            major_login_result["serverUrl"], 
-            major_login_result["token"], 
+            server_url, 
+            token, 
             uid_int, 
             need_gallery_info, 
             call_sign_src_int,
@@ -476,6 +520,33 @@ def get_account_info():
             "code": "INTERNAL_SERVER_ERROR"
         }
         return jsonify(response), 500, {'Content-Type': 'application/json; charset=utf-8'}
+
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Lightweight status probe (no upstream calls).
+
+    Lets callers distinguish "API process up, Garena login failing" from
+    "API process crashed". Cached per-server sessions and their remaining
+    TTL are reported so operators can see login health at a glance.
+    """
+    now = time.time()
+    with _session_lock:
+        cached = {
+            server: {
+                "expires_in_seconds": max(0, int(entry["expires_at"] - now)),
+                "login_version": entry.get("version"),
+            }
+            for server, entry in _session_cache.items()
+            if entry["expires_at"] > now
+        }
+    return jsonify({
+        "status": "ok",
+        "versions_tried": list(RELEASEVERSIONS),
+        "regions": sorted(accounts.keys()),
+        "cached_sessions": cached,
+    }), 200
 
 
 
