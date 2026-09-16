@@ -6,6 +6,43 @@ from datetime import datetime, timedelta
 from Utilities.until import load_accounts
 from Api.Account import get_garena_token, get_major_login
 from Api.InGame import get_player_personal_show, get_player_stats, search_account_by_keyword
+from Configuration.APIConfiguration import RELEASEVERSION
+
+
+def describe_major_login_failure(resp):
+    """Build an actionable message from a MajorLogin failure payload.
+
+    The login server returns either plain text (e.g. "SignError1" =
+    ReleaseVersion/signature rejected) or a protobuf queue/blacklist
+    notice (e.g. "Protection Bypass" / "Exploiting loopholes" = guest
+    account flagged). Surfacing it beats a generic "Major login failed".
+    """
+    hint = (" If the reason mentions SignError, update FF_RELEASE_VERSION to the "
+            "current live OB version. If it mentions Protection Bypass / "
+            "Exploiting loopholes, the guest account in AccountConfiguration.json "
+            "is flagged — regenerate accounts from a real device/network (datacenter "
+            "IPs get flagged) and redeploy.")
+    if not resp:
+        return "Empty response from login server." + hint, hint
+    if isinstance(resp, dict):
+        if resp.get("_raw_error"):
+            detail = (f"Upstream: {resp.get('_raw_error')} "
+                      f"(host={resp.get('_host')}, http={resp.get('_http_status')}, "
+                      f"ReleaseVersion={RELEASEVERSION})." + hint)
+            return detail, hint
+        parts = []
+        if resp.get("_reason"):
+            parts.append(f"server reason: {resp['_reason']}")
+        if resp.get("queueInfo"):
+            parts.append(f"queueInfo={resp['queueInfo']}")
+        if resp.get("blacklist"):
+            parts.append(f"blacklist={resp['blacklist']}")
+        if parts:
+            return ("Upstream MajorLogin rejected without token: " + "; ".join(parts) +
+                    f" (host={resp.get('_host')}, http={resp.get('_http_status')}, "
+                    f"ReleaseVersion={RELEASEVERSION})." + hint), hint
+        return (f"Upstream MajorLogin returned no token: {str(resp)[:300]}" + hint), hint
+    return f"Upstream MajorLogin failure: {str(resp)[:300]}" + hint, hint
 
 
 accounts = load_accounts()
@@ -45,7 +82,8 @@ def get_search_account_by_keyword():
         # Get major login credentials
         login_response = get_major_login(auth_response["access_token"], auth_response["open_id"])
         if not login_response or 'token' not in login_response:
-            return json.dumps({"error": "Major login failed"}, indent=2), 401, {'Content-Type': 'application/json; charset=utf-8'}
+            detail, _ = describe_major_login_failure(login_response)
+            return json.dumps({"error": "Major login failed", "detail": detail}, indent=2), 401, {'Content-Type': 'application/json; charset=utf-8'}
         
         # Search for accounts
         search_results = search_account_by_keyword(login_response["serverUrl"], login_response["token"], search_term)
@@ -130,10 +168,11 @@ def get_player_stat():
             major_login_result = get_major_login(garena_token_result["access_token"], garena_token_result["open_id"])
             
             if not major_login_result or 'token' not in major_login_result:
+                detail, _ = describe_major_login_failure(major_login_result)
                 return jsonify({
                     "success": False,
                     "error": "Major login failed",
-                    "message": "Failed to obtain Major login token"
+                    "message": detail
                 }), 401
                 
         except Exception as e:
@@ -371,10 +410,11 @@ def get_account_info():
         # Step 2: Get major login
         major_login_result = get_major_login(garena_token_result["access_token"], garena_token_result["open_id"])
         if not major_login_result or 'serverUrl' not in major_login_result or 'token' not in major_login_result:
+            detail, _ = describe_major_login_failure(major_login_result)
             response = {
                 "status": "error",
                 "error": "Login Failed",
-                "message": "Failed to perform major login. Service unavailable.",
+                "message": detail,
                 "code": "MAJOR_LOGIN_FAILED"
             }
             return jsonify(response), 401, {'Content-Type': 'application/json; charset=utf-8'}

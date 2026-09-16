@@ -1,4 +1,5 @@
 import json
+push the codeimport os
 from google.protobuf.message import Message
 from google.protobuf import json_format, message
 from Crypto.Cipher import AES
@@ -6,13 +7,27 @@ from Configuration.AESConfiguration import MAIN_KEY, MAIN_IV
 
 # Load accounts from JSON file
 def load_accounts():
-    try:
-        with open('./Configuration/AccountConfiguration.json', 'r') as file:
-            return json.load(file)
-    except FileNotFoundError:
-        raise Exception("AccountConfiguration.json file not found")
-    except json.JSONDecodeError:
-        raise Exception("Error parsing AccountConfiguration.json")
+    candidates = [
+        os.environ.get("FF_ACCOUNTS_FILE", ""),
+        os.path.join(os.path.dirname(__file__), "..", "Configuration", "AccountConfiguration.json"),
+        "./Configuration/AccountConfiguration.json",
+        "Configuration/AccountConfiguration.json",
+        os.path.join(os.path.dirname(__file__), "..", "AccountConfiguration.json"),
+        "./AccountConfiguration.json",
+    ]
+    last_err = None
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            with open(os.path.normpath(path), 'r') as file:
+                return json.load(file)
+        except FileNotFoundError as e:
+            last_err = e
+            continue
+        except json.JSONDecodeError:
+            raise Exception(f"Error parsing {path}")
+    raise Exception(f"AccountConfiguration.json file not found (tried {candidates}): {last_err}")
 
 def pad(text: bytes) -> bytes:
     padding_length = AES.block_size - (len(text) % AES.block_size)

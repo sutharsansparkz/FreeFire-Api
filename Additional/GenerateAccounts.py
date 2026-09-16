@@ -69,7 +69,9 @@ def register(region):
     pf = {1:f"0xMe{''.join('⁰¹²³⁴⁵⁶⁷⁸⁹'[int(d)] for d in str(random.randint(1,9999)))}",2:at,3:oid,5:102000007,6:4,7:1,13:1,14:e(oid),15:region,16:1}
     ed = bytes.fromhex(aes(ep(pf).hex()))
     
-    hs = {"Authorization":f"Bearer {at}","X-Unity-Version":"2018.4.11f1","X-GA":"v1 1","ReleaseVersion":"OB50","Content-Type":"application/octet-stream","Content-Length":str(len(ed)),"User-Agent":ua,"Host":"loginbp.ggblueshark.com","Connection":"Keep-Alive","Accept-Encoding":"gzip"}
+    # Keep in sync with Configuration/APIConfiguration.py (current live OB).
+    release_version = "OB55"
+    hs = {"Authorization":f"Bearer {at}","X-Unity-Version":"2018.4.11f1","X-GA":"v1 1","ReleaseVersion":release_version,"Content-Type":"application/octet-stream","Content-Length":str(len(ed)),"User-Agent":ua,"Host":"loginbp.ggblueshark.com","Connection":"Keep-Alive","Accept-Encoding":"gzip"}
     r3 = session.post('https://loginbp.ggblueshark.com/MajorRegister', data=ed, headers=hs, timeout=10)
     session.close()
     
