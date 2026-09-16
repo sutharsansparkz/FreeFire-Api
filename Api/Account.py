@@ -1,4 +1,5 @@
 import re
+from typing import Optional
 
 import requests
 import Proto.compiled.MajorLogin_pb2
@@ -50,7 +51,7 @@ def get_garena_token(uid, password):
 
 
 
-def extract_login_reason(raw: bytes) -> str | None:
+def extract_login_reason(raw: bytes) -> Optional[str]:
     """Best-effort extraction of a human-readable ban/queue reason from a
     MajorLogin protobuf payload.
 
